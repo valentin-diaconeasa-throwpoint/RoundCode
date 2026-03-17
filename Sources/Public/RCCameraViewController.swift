@@ -185,6 +185,7 @@ extension RCCameraViewController {
   
   private func configureVideoStream() {
     guard let captureDevice = AVCaptureDevice.default(for: .video) else { return }
+
     do {
       captureSession.sessionPreset = .hd1280x720
       let input = try AVCaptureDeviceInput(device: captureDevice)
@@ -256,9 +257,10 @@ extension RCCameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
     )
     vImageCopyBuffer(&srcBuffer, &dstBuffer, 1, vImage_Flags(kvImageNoFlags))
     
-    coder.imageDecoder.size = size
-    coder.imageDecoder.bytesPerRow = size  // Now tightly packed, no padding
+    coder.scanningMode = determineScanningMode(buffer: lumaCopy.assumingMemoryBound(to: UInt8.self), size: size)
     
+    coder.imageDecoder.size = size
+    coder.imageDecoder.bytesPerRow = size
     if let message = try? coder.decode(buffer: lumaCopy.assumingMemoryBound(to: UInt8.self)) {
       captureSession.stopRunning()
       Task { @MainActor [weak self] in
@@ -268,4 +270,27 @@ extension RCCameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
     }
   }
   
+  /// Auto-determines the ScanningMode based on the average light of the buffer contents
+  /// Complexity O(1)
+  /// No more nead to use the Dark-mode scanning button
+  private func determineScanningMode(buffer: UnsafeMutablePointer<UInt8>, size: Int) -> RCCoder.ScanningMode {
+    // Sample only from the outer edge — well outside the circular QR pattern
+    // The QR dots sit at roughly 40-50% radius, center image at ~40%
+    // Sample at ~5% from each edge to be safely in the background area
+    let edge = size / 20
+    let samplePoints = [
+      edge * size + edge,                        // top-left corner
+      edge * size + size / 2,                    // top-center
+      edge * size + (size - edge),               // top-right corner
+      (size / 2) * size + edge,                  // middle-left
+      (size / 2) * size + (size - edge),         // middle-right
+      (size - edge) * size + edge,               // bottom-left corner
+      (size - edge) * size + size / 2,           // bottom-center
+      (size - edge) * size + (size - edge)       // bottom-right corner
+    ]
+    let avgBrightness = samplePoints.reduce(0) { $0 + Int(buffer[$1]) } / samplePoints.count
+    let isDarkMode = avgBrightness < 128
+    //print("[Scanner] Detected scanning mode as \(isDarkMode ? "dark" : "light")")
+    return isDarkMode ? .darkBackground : .lightBackground
+  }
 }
