@@ -29,17 +29,19 @@ public final class RCCameraViewController: UIViewController {
   public weak var delegate: RCCameraViewControllerDelegate?
   public var coder = RCCoder()
   override public var supportedInterfaceOrientations: UIInterfaceOrientationMask {
-    .portrait
+    .all
   }
   public override var prefersStatusBarHidden: Bool {
     true
   }
   //Private properties
   private var brightness = CGFloat(0)
-  private var captureSession = AVCaptureSession()
+  nonisolated(unsafe) private var captureSession = AVCaptureSession()
   private var videoPreviewLayer: AVCaptureVideoPreviewLayer?
   private var maskLayer = CAShapeLayer()
   private var circleLayer = CAShapeLayer()
+  private var currentOrientation: AVCaptureVideoOrientation = .portrait
+  
   private lazy var cameraView: UIView = {
     let cameraView = UIView()
     cameraView.backgroundColor = .clear
@@ -51,6 +53,16 @@ public final class RCCameraViewController: UIViewController {
     cameraView.bottomAnchor.constraint(equalTo: self.view.bottomAnchor, constant: 0).isActive = true
     return cameraView
   }()
+  
+  private var currentVideoOrientation: AVCaptureVideoOrientation {
+    switch UIDevice.current.orientation {
+    case .portrait: return .portrait
+    case .portraitUpsideDown: return .portraitUpsideDown
+    case .landscapeLeft: return .landscapeRight  // Note: these are intentionally swapped
+    case .landscapeRight: return .landscapeLeft   // Device and video orientations are mirrored
+    default: return .portrait
+    }
+  }
   
   //MARK: Inits
   public required init?(coder: NSCoder) {
@@ -80,6 +92,7 @@ public final class RCCameraViewController: UIViewController {
 public extension RCCameraViewController {
   override func viewDidLoad() {
     super.viewDidLoad()
+    currentOrientation = currentVideoOrientation
     configureMaskLayer()
     configureVideoStream()
     configureVideoPreview()
@@ -90,12 +103,16 @@ public extension RCCameraViewController {
   
   override func viewWillAppear(_ animated: Bool) {
     super.viewWillAppear(animated)
-    captureSession.startRunning()
+    Task.detached { [weak self] in
+      self?.captureSession.startRunning()
+    }
   }
   
   override func viewWillDisappear(_ animated: Bool) {
     super.viewWillDisappear(animated)
-    captureSession.stopRunning()
+    Task.detached { [weak self] in
+      self?.captureSession.stopRunning()
+    }
   }
   
   override func viewDidAppear(_ animated: Bool) {
@@ -113,6 +130,17 @@ public extension RCCameraViewController {
     super.viewDidLayoutSubviews()
     configureMaskLayer()
     videoPreviewLayer?.frame = view.bounds
+    currentOrientation = currentVideoOrientation
+  }
+  
+  override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+    super.viewWillTransition(to: size, with: coordinator)
+    coordinator.animate(alongsideTransition: { [weak self] _ in
+      guard let self else { return }
+      self.currentOrientation = self.currentVideoOrientation
+      self.videoPreviewLayer?.connection?.videoOrientation = self.currentOrientation
+      self.videoPreviewLayer?.frame = self.view.bounds
+    })
   }
 }
 
@@ -131,7 +159,9 @@ extension RCCameraViewController {
   }
   
   @objc private func cancelPressed() {
-    captureSession.stopRunning()
+    Task.detached { [weak self] in
+      self?.captureSession.stopRunning()
+    }
     delegate?.cameraViewControllerDidCancel()
     dismiss(animated: true)
   }
@@ -168,11 +198,11 @@ extension RCCameraViewController {
     }
   }
   
-  private func configureVideoPreview(orientation: AVCaptureVideoOrientation = .portrait) {
+  private func configureVideoPreview() {
     videoPreviewLayer?.removeFromSuperlayer()
     videoPreviewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
     videoPreviewLayer?.videoGravity = .resizeAspectFill
-    videoPreviewLayer?.connection?.videoOrientation = orientation
+    videoPreviewLayer?.connection?.videoOrientation = currentVideoOrientation
     videoPreviewLayer?.frame = view.layer.bounds
     view.layer.addSublayer(videoPreviewLayer!)
   }
@@ -182,25 +212,51 @@ extension RCCameraViewController {
 extension RCCameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
   
   public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-    connection.videoOrientation = .portrait
+    connection.videoOrientation = currentOrientation
     guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
     CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
     let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
     let bufferHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
     let bufferWidth = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
     let size = min(bufferWidth, bufferHeight)
-    let origin = (max(bufferWidth, bufferHeight) - size) / 2
-    let lumaBaseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)?.advanced(by: bytesPerRow * origin)
-    let lumaCopy = UnsafeMutableRawPointer.allocate(byteCount: bytesPerRow * size, alignment: MemoryLayout<UInt8>.alignment)
-    lumaCopy.copyMemory(from: lumaBaseAddress!, byteCount: bytesPerRow * size)
+    
+    // Crop center square — offset depends on which dimension is larger
+    let rowOffset: Int
+    let columnOffset: Int
+    if bufferHeight > bufferWidth {
+      // Portrait: crop top/bottom
+      rowOffset = (bufferHeight - size) / 2
+      columnOffset = 0
+    } else {
+      // Landscape: crop left/right
+      rowOffset = 0
+      columnOffset = (bufferWidth - size) / 2
+    }
+    
+    guard let baseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else {
+      CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+      return
+    }
+    
+    // Copy the center square region row by row
+    let lumaCopy = UnsafeMutableRawPointer.allocate(byteCount: size * size, alignment: MemoryLayout<UInt8>.alignment)
+    for row in 0..<size {
+      let srcRow = baseAddress.advanced(by: bytesPerRow * (row + rowOffset) + columnOffset)
+      let dstRow = lumaCopy.advanced(by: size * row)
+      dstRow.copyMemory(from: srcRow, byteCount: size)
+    }
+    
     coder.imageDecoder.size = size
-    coder.imageDecoder.bytesPerRow = bytesPerRow
+    coder.imageDecoder.bytesPerRow = size  // Now tightly packed, no padding
     if let message = try? coder.decode(buffer: lumaCopy.assumingMemoryBound(to: UInt8.self)) {
+      lumaCopy.deallocate()
+      CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
       captureSession.stopRunning()
-      DispatchQueue.main.async {[weak self] in
+      Task { @MainActor [weak self] in
         self?.delegate?.cameraViewController(didFinishScanning: message)
         self?.dismiss(animated: true)
       }
+      return
     }
     lumaCopy.deallocate()
     CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
