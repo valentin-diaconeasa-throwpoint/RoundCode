@@ -22,6 +22,7 @@
 
 import UIKit
 import AVFoundation
+import Accelerate
 
 public final class RCCameraViewController: UIViewController {
   
@@ -215,6 +216,8 @@ extension RCCameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
     connection.videoOrientation = currentOrientation
     guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
     CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+    
     let bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
     let bufferHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
     let bufferWidth = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
@@ -233,32 +236,36 @@ extension RCCameraViewController: AVCaptureVideoDataOutputSampleBufferDelegate {
       columnOffset = (bufferWidth - size) / 2
     }
     
-    guard let baseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else {
-      CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
-      return
-    }
+    guard let baseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else { return }
     
-    // Copy the center square region row by row
     let lumaCopy = UnsafeMutableRawPointer.allocate(byteCount: size * size, alignment: MemoryLayout<UInt8>.alignment)
-    for row in 0..<size {
-      let srcRow = baseAddress.advanced(by: bytesPerRow * (row + rowOffset) + columnOffset)
-      let dstRow = lumaCopy.advanced(by: size * row)
-      dstRow.copyMemory(from: srcRow, byteCount: size)
-    }
+    defer { lumaCopy.deallocate() }
+    
+    // Accelerate-optimized strided copy — tightly packed output, works for both orientations
+    var srcBuffer = vImage_Buffer(
+      data: baseAddress.advanced(by: bytesPerRow * rowOffset + columnOffset),
+      height: vImagePixelCount(size),
+      width: vImagePixelCount(size),
+      rowBytes: bytesPerRow
+    )
+    var dstBuffer = vImage_Buffer(
+      data: lumaCopy,
+      height: vImagePixelCount(size),
+      width: vImagePixelCount(size),
+      rowBytes: size
+    )
+    vImageCopyBuffer(&srcBuffer, &dstBuffer, 1, vImage_Flags(kvImageNoFlags))
     
     coder.imageDecoder.size = size
     coder.imageDecoder.bytesPerRow = size  // Now tightly packed, no padding
+    
     if let message = try? coder.decode(buffer: lumaCopy.assumingMemoryBound(to: UInt8.self)) {
-      lumaCopy.deallocate()
-      CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
       captureSession.stopRunning()
       Task { @MainActor [weak self] in
         self?.delegate?.cameraViewController(didFinishScanning: message)
         self?.dismiss(animated: true)
       }
-      return
     }
-    lumaCopy.deallocate()
-    CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
   }
+  
 }
