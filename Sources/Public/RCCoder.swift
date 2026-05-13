@@ -67,12 +67,20 @@ public extension RCCoder {
   }
 }
 
-extension RCCoder {
-  
+public extension RCCoder {
+
+  /// Decodes a tightly-packed luma buffer (8-bit grayscale). Call `setDecoderBufferSize(_:)` first to configure the expected dimensions.
   func decode(buffer: UnsafeMutablePointer<UInt8>) throws -> String {
     let bits = try imageDecoder.process(pointer: buffer)
     let message = try bitCoder.decode(bits)
     return message
+  }
+
+  /// Configures the internal image decoder for a square luma buffer of the given side length.
+  /// Both `size` and `bytesPerRow` are set to the same value (assumes tightly-packed buffer).
+  func setDecoderBufferSize(_ size: Int) {
+    imageDecoder.size = size
+    imageDecoder.bytesPerRow = size
   }
 }
 
